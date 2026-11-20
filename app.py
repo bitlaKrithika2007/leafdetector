@@ -1,76 +1,211 @@
 import json
 import numpy as np
+import tensorflow as tf
 import streamlit as st
 from PIL import Image
-import tensorflow as tf
 
-st.set_page_config(page_title="Model Classifier", page_icon="🧠", layout="centered")
-st.title("Image Classifier")
-st.write("Upload an image to run inference with `ldm.keras`.")
+# -------------------------------
+# 1. PAGE CONFIGURATION
+# -------------------------------
 
+st.set_page_config(
+    page_title="Plant Leaf Disease Detector",
+    page_icon="🌿",
+    layout="centered"
+)
+
+st.title("🌿 Plant Leaf Disease Detector")
+st.write(
+    "Upload a clear image of a plant leaf to detect "
+    "possible diseases using Transfer Learning."
+)
+
+# -------------------------------
+# 2. LOAD TRAINED MODEL
+# -------------------------------
 
 @st.cache_resource
 def load_model():
     return tf.keras.models.load_model("ldm.keras")
 
-
-@st.cache_data
-def load_class_names():
-    with open("classnames.json", "r", encoding="utf-8") as f:
-        data = json.load(f)
-    # Supports either a list ["cat", "dog"] or dict {"0": "cat", "1": "dog"}
-    if isinstance(data, dict):
-        return [data[str(i)] for i in range(len(data))]
-    return list(data)
-
-
-def preprocess_image(image: Image.Image, target_size: tuple[int, int]) -> np.ndarray:
-    img = image.convert("RGB").resize(target_size)
-    arr = np.asarray(img, dtype=np.float32)
-    # Adjust scaling if your model expects [-1, 1] or unscaled [0, 255]
-    arr = arr / 255.0
-    return np.expand_dims(arr, axis=0)
-
-
 try:
     model = load_model()
-    class_names = load_class_names()
+
+    with open("classnames.json", "r") as f:
+        class_names = json.load(f)
+
 except Exception as e:
-    st.error(f"Failed to load model or classnames.json: {e}")
+    st.error("Unable to load the trained model or class labels.")
+    st.error(str(e))
     st.stop()
 
-# Infer input height/width from model input_shape (e.g., (None, 224, 224, 3))
-input_shape = model.input_shape
-if isinstance(input_shape, list):
-    input_shape = input_shape[0]
-target_size = (int(input_shape[1]), int(input_shape[2]))
+# -------------------------------
+# 3. CLEAN CLASS NAMES
+# -------------------------------
 
-uploaded_file = st.file_uploader("Choose an image", type=["jpg", "jpeg", "png", "webp"])
+def clean(name):
+    crop, _, disease = name.partition("___")
+
+    crop = crop.replace("_", " ").replace("(", "").replace(")", "").strip()
+    disease = disease.replace("_", " ").strip() or "unknown"
+
+    return crop, disease
+
+
+crops = sorted(set(clean(c)[0] for c in class_names))
+SUPPORTED = ", ".join(crops)
+
+# -------------------------------
+# 4. WARNING THRESHOLDS
+# -------------------------------
+
+HIGH = 0.85
+LOW = 0.60
+MARGIN = 0.25
+
+# -------------------------------
+# 5. IMAGE UPLOAD
+# -------------------------------
+
+st.subheader("Upload Leaf Image")
+
+uploaded_file = st.file_uploader(
+    "Choose a leaf image",
+    type=["jpg", "jpeg", "png"]
+)
+
+# -------------------------------
+# 6. PREDICTION
+# -------------------------------
 
 if uploaded_file is not None:
-    image = Image.open(uploaded_file)
-    st.image(image, caption="Uploaded Image", use_container_width=True)
 
-    if st.button("Predict", type="primary"):
-        with st.spinner("Running prediction..."):
-            batch = preprocess_image(image, target_size)
-            preds = model.predict(batch, verbose=0)
-            probs = preds[0]
+    img = Image.open(uploaded_file).convert("RGB")
 
-            # Apply softmax if model outputs raw logits (values outside [0, 1] or sum != 1)
-            if np.min(probs) < 0.0 or np.max(probs) > 1.0 or not np.isclose(np.sum(probs), 1.0, atol=1e-2):
-                probs = tf.nn.softmax(probs).numpy()
+    st.image(
+        img,
+        caption="Uploaded Leaf Image",
+        use_container_width=True
+    )
 
-            top_idx = int(np.argmax(probs))
-            top_label = class_names[top_idx] if top_idx < len(class_names) else f"Class {top_idx}"
-            top_conf = float(probs[top_idx])
+    if st.button("Detect Disease", type="primary"):
 
-            st.subheader(f"Prediction: {top_label}")
-            st.write(f"Confidence: **{top_conf * 100:.2f}%**")
+        with st.spinner("Analyzing your leaf image..."):
 
-            st.write("### Class Probabilities")
-            prob_dict = {
-                (class_names[i] if i < len(class_names) else f"Class {i}"): float(probs[i])
-                for i in range(len(probs))
-            }
-            st.bar_chart(prob_dict)
+            # Preprocessing: same as original Colab notebook
+            processed_img = img.resize((224, 224))
+
+            arr = np.expand_dims(
+                np.array(processed_img, dtype="float32"),
+                axis=0
+            )
+
+            probs = model.predict(arr, verbose=0)[0]
+
+            order = np.argsort(probs)[::-1]
+
+            top = float(probs[order[0]])
+            second = float(probs[order[1]])
+
+            crop, disease = clean(class_names[int(order[0])])
+
+            margin = top - second
+
+        st.divider()
+        st.subheader("Detection Result")
+
+        # -------------------------------
+        # 7. SMART WARNING SYSTEM
+        # -------------------------------
+
+        if top < LOW:
+
+            st.error("❌ Cannot recognize this leaf")
+
+            st.write(
+                f"Confidence is only **{top*100:.0f}%**."
+            )
+
+            st.write(
+                "This may be an unsupported plant or an unclear image."
+            )
+
+            st.info(
+                "Try uploading one clear leaf image in daylight "
+                "with a plain background."
+            )
+
+            st.write("**Supported crops:**", SUPPORTED)
+
+        elif top < HIGH or margin < MARGIN:
+
+            st.warning("⚠️ Not sure about this result")
+
+            st.write(
+                f"Best guess: **{crop} - {disease}**"
+            )
+
+            st.write(
+                f"Confidence: **{top*100:.0f}%**"
+            )
+
+            st.info(
+                "The model is not sufficiently certain. "
+                "Try a clearer image or consult an agriculture expert."
+            )
+
+            st.write("**Supported crops:**", SUPPORTED)
+
+        else:
+
+            if disease.lower() == "healthy":
+
+                st.success(f"✅ Likely healthy {crop} leaf")
+
+            else:
+
+                st.success(f"✅ Likely: {crop} - {disease}")
+
+            st.write(
+                f"Confidence: **{top*100:.0f}%**"
+            )
+
+        # -------------------------------
+        # 8. TOP 3 PREDICTIONS
+        # -------------------------------
+
+        st.divider()
+        st.subheader("Top 3 Predictions")
+
+        for i in order[:3]:
+
+            label = " - ".join(
+                clean(class_names[int(i)])
+            )
+
+            confidence = float(probs[int(i)]) * 100
+
+            st.write(f"**{label}**")
+
+            st.progress(float(probs[int(i)]))
+
+            st.caption(f"{confidence:.2f}% confidence")
+
+        # -------------------------------
+        # 9. DISCLAIMER
+        # -------------------------------
+
+        st.divider()
+
+        st.caption(
+            "This is a student project model. It only recognizes "
+            "the crops it was trained on and may produce incorrect "
+            "predictions. Confirm results with an agriculture expert "
+            "before treating plants."
+        )
+
+else:
+
+    st.info("Please upload a leaf image to begin detection.")
+
+    st.write("**Supported crops:**", SUPPORTED)
